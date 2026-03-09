@@ -284,6 +284,29 @@ with st.sidebar:
 
     st.divider()
 
+    # OpenAI API Key input
+    st.subheader("OpenAI API Key")
+    # Initialize from environment if not already in session_state
+    if "openai_api_key" not in st.session_state:
+        env_key = os.environ.get("OPENAI_API_KEY", "")
+        if env_key:
+            st.session_state.openai_api_key = env_key
+    
+    api_key_input = st.text_input(
+        "Enter your OpenAI API key",
+        type="password",
+        value=st.session_state.get("openai_api_key", ""),
+        help="Your API key is stored in session only and never saved.",
+        key="openai_api_key_input",
+    )
+    # Always update session_state with what's in the input field
+    st.session_state.openai_api_key = api_key_input
+    
+    if not api_key_input:
+        st.warning("⚠️ Please enter your OpenAI API key")
+
+    st.divider()
+
     # New conversation
     if st.button("＋ New conversation", use_container_width=True, type="primary"):
         new_id = make_conversation_id()
@@ -383,12 +406,19 @@ with st.sidebar:
     st.divider()
 
     with st.expander("Configuration"):
-        api_key_set = bool(os.environ.get("OPENAI_API_KEY"))
+        api_key_from_session = bool(st.session_state.get("openai_api_key"))
+        api_key_from_env = bool(os.environ.get("OPENAI_API_KEY"))
+        api_key_set = api_key_from_session or api_key_from_env
         horizon_url = os.environ.get("HORIZON_MCP_URL", "")
         horizon_key = os.environ.get("HORIZON_API_KEY", "")
         token_set = bool(os.environ.get("PATHWAYS_API_TOKEN"))
         
-        st.markdown(f"- OpenAI API key: {'✅' if api_key_set else '❌ missing'}")
+        if api_key_from_session:
+            st.markdown(f"- OpenAI API key: ✅ (from input)")
+        elif api_key_from_env:
+            st.markdown(f"- OpenAI API key: ✅ (from environment)")
+        else:
+            st.markdown(f"- OpenAI API key: ❌ missing")
         
         if horizon_url and horizon_key:
             st.markdown(f"- **Horizon MCP URL**: ✅ `{horizon_url}`")
@@ -453,10 +483,10 @@ if active_prompt:
     st.session_state.pending_prompt = None  # consume it
 
 if active_prompt:
-    # Validate OpenAI key
-    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    # Validate OpenAI key (prefer session_state over environment)
+    openai_key = st.session_state.get("openai_api_key", "") or os.environ.get("OPENAI_API_KEY", "")
     if not openai_key:
-        st.error("OPENAI_API_KEY is not set. Add it to your .env file.")
+        st.error("⚠️ Please enter your OpenAI API key in the sidebar.")
         st.stop()
 
     # Use the MCP client only if already connected — never auto-start here.
