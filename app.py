@@ -23,7 +23,7 @@ load_dotenv(_HERE / ".env")
 
 # Support Streamlit Cloud secrets (they override the .env if present)
 try:
-    for _key in ("OPENAI_API_KEY", "PATHWAYS_API_TOKEN", "PATHWAYS_API_URL"):
+    for _key in ("OPENAI_API_KEY", "PATHWAYS_API_TOKEN", "PATHWAYS_API_URL", "HORIZON_MCP_URL", "HORIZON_API_KEY"):
         if _key in st.secrets:
             os.environ[_key] = st.secrets[_key]
 except Exception:
@@ -201,21 +201,40 @@ def get_mcp_client():
     if "mcp_client" not in st.session_state or st.session_state.mcp_client is None:
         from mcp_client import MCPClient
 
-        token = os.environ.get("PATHWAYS_API_TOKEN", "")
-        url = os.environ.get("PATHWAYS_API_URL", "")
-        env = {}
-        if token:
-            env["PATHWAYS_API_TOKEN"] = token
-        if url:
-            env["PATHWAYS_API_URL"] = url
+        # Check if Horizon is configured
+        horizon_url = os.environ.get("HORIZON_MCP_URL", "")
+        horizon_key = os.environ.get("HORIZON_API_KEY", "")
+        
+        if horizon_url and horizon_key:
+            # Horizon HTTP mode
+            spinner_msg = f"Connecting to Horizon MCP server…"
+            with st.spinner(spinner_msg):
+                try:
+                    st.session_state.mcp_client = MCPClient(
+                        horizon_url=horizon_url,
+                        horizon_api_key=horizon_key,
+                    )
+                except Exception as exc:
+                    st.session_state.mcp_client = None
+                    st.error(f"Failed to connect to Horizon MCP server: {exc}")
+                    return None
+        else:
+            # Local stdio mode
+            token = os.environ.get("PATHWAYS_API_TOKEN", "")
+            url = os.environ.get("PATHWAYS_API_URL", "")
+            env = {}
+            if token:
+                env["PATHWAYS_API_TOKEN"] = token
+            if url:
+                env["PATHWAYS_API_URL"] = url
 
-        with st.spinner("Starting Pathways MCP server…"):
-            try:
-                st.session_state.mcp_client = MCPClient(env=env)
-            except Exception as exc:
-                st.session_state.mcp_client = None
-                st.error(f"Failed to start MCP server: {exc}")
-                return None
+            with st.spinner("Starting Pathways MCP server…"):
+                try:
+                    st.session_state.mcp_client = MCPClient(env=env)
+                except Exception as exc:
+                    st.session_state.mcp_client = None
+                    st.error(f"Failed to start MCP server: {exc}")
+                    return None
 
     return st.session_state.mcp_client
 
@@ -314,9 +333,15 @@ with st.sidebar:
     client = st.session_state.mcp_client
     if client is not None:
         tools = client.tools
+        # Show server info
+        horizon_url = os.environ.get("HORIZON_MCP_URL", "")
         api_url = os.environ.get("PATHWAYS_API_URL", "").rstrip("/")
-        st.success(f"✅ MCP connected — {len(tools)} tools")
-        st.caption(f"Server: `{api_url}`")
+        if horizon_url:
+            st.success(f"✅ Horizon MCP connected — {len(tools)} tools")
+            st.caption(f"Server: `{horizon_url}`")
+        else:
+            st.success(f"✅ MCP connected — {len(tools)} tools")
+            st.caption(f"Server: `{api_url}`")
         with st.expander("Available tools", expanded=False):
             for t in tools:
                 desc_short = t.description[:100] + "…" if len(t.description) > 100 else t.description
@@ -359,9 +384,20 @@ with st.sidebar:
 
     with st.expander("Configuration"):
         api_key_set = bool(os.environ.get("OPENAI_API_KEY"))
+        horizon_url = os.environ.get("HORIZON_MCP_URL", "")
+        horizon_key = os.environ.get("HORIZON_API_KEY", "")
         token_set = bool(os.environ.get("PATHWAYS_API_TOKEN"))
+        
         st.markdown(f"- OpenAI API key: {'✅' if api_key_set else '❌ missing'}")
-        st.markdown(f"- Pathways token: {'✅' if token_set else '❌ missing'}")
+        
+        if horizon_url and horizon_key:
+            st.markdown(f"- **Horizon MCP URL**: ✅ `{horizon_url}`")
+            st.markdown(f"- **Horizon API key**: ✅ configured")
+            st.markdown(f"- Mode: **Horizon HTTP**")
+        else:
+            st.markdown(f"- Pathways token: {'✅' if token_set else '❌ missing'}")
+            st.markdown(f"- Mode: **Local stdio**")
+        
         st.markdown(f"- Model: `{selected_model}`")
         st.markdown(f"- System prompt: `{SYSTEM_PROMPT_PATH.name}`")
 

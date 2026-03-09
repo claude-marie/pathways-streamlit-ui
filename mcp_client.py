@@ -1,9 +1,13 @@
-"""Thread-safe wrapper around the async MCP stdio client.
+"""Thread-safe wrapper around the async MCP client (stdio or HTTP).
 
 The MCP SDK is fully async. Streamlit runs synchronously in the main thread.
 This module bridges the gap by running the MCP session in a background thread
 that owns a dedicated asyncio event loop, and exposing a simple synchronous API
 to the Streamlit app.
+
+Supports two modes:
+- Local stdio: launches pathways_mcp.server as subprocess (default)
+- Horizon HTTP: connects to remote Horizon MCP server via HTTP with Bearer token
 """
 
 import asyncio
@@ -21,6 +25,14 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 logger = logging.getLogger(__name__)
 
 _STREAMLIT_UI_DIR = Path(__file__).parent.resolve()
+
+# Try to import FastMCP for HTTP support (optional)
+try:
+    from fastmcp import Client as FastMCPClient
+    FASTMCP_AVAILABLE = True
+except ImportError:
+    FASTMCP_AVAILABLE = False
+    FastMCPClient = None
 
 
 class MCPToolInfo:
@@ -55,11 +67,19 @@ class MCPPromptInfo:
 
 
 class MCPClient:
-    """Synchronous facade over an async MCP stdio session.
+    """Synchronous facade over an async MCP session (stdio or HTTP).
 
     Usage
     -----
+    # Local stdio mode (default)
     client = MCPClient(env={"PATHWAYS_API_TOKEN": "..."})
+    
+    # Horizon HTTP mode
+    client = MCPClient(
+        horizon_url="https://pathways-agent.fastmcp.app/mcp",
+        horizon_api_key="your_api_key"
+    )
+    
     # client.tools    → list[MCPToolInfo]
     # client.prompts  → list[MCPPromptInfo]
     # client.call_tool("list_segmentations", {})  → str
@@ -67,27 +87,44 @@ class MCPClient:
     # client.shutdown()
     """
 
-    def __init__(self, env: dict[str, str] | None = None):
+    def __init__(
+        self,
+        env: dict[str, str] | None = None,
+        horizon_url: str | None = None,
+        horizon_api_key: str | None = None,
+    ):
         self._env = env or {}
+        self._horizon_url = horizon_url or os.environ.get("HORIZON_MCP_URL")
+        self._horizon_api_key = horizon_api_key or os.environ.get("HORIZON_API_KEY")
+        self._use_horizon = bool(self._horizon_url and self._horizon_api_key)
+        
         self._tools: list[MCPToolInfo] = []
         self._prompts: list[MCPPromptInfo] = []
         self._session: ClientSession | None = None
+        self._fastmcp_client: Any = None  # FastMCP client if using Horizon
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event: asyncio.Event | None = None
         self._initialized = threading.Event()
         self._init_error: Exception | None = None
+
+        if self._use_horizon and not FASTMCP_AVAILABLE:
+            raise RuntimeError(
+                "Horizon HTTP mode requires fastmcp. Install with: pip install fastmcp>=2.0.0"
+            )
 
         self._thread = threading.Thread(
             target=self._thread_main, name="mcp-session", daemon=True
         )
         self._thread.start()
 
-        # Wait up to 30 s for the MCP server to start and initialise
+        # Wait up to 60 s for the MCP server to start and initialise
+        timeout_msg = (
+            "Horizon MCP server did not respond within 60 s."
+            if self._use_horizon
+            else "MCP server did not initialise within 60 s. Check PATHWAYS_API_TOKEN and server logs."
+        )
         if not self._initialized.wait(timeout=60):
-            raise RuntimeError(
-                "MCP server did not initialise within 60 s. "
-                "Check PATHWAYS_API_TOKEN and server logs."
-            )
+            raise RuntimeError(timeout_msg)
         if self._init_error:
             raise self._init_error
 
@@ -108,6 +145,68 @@ class MCPClient:
             self._loop.close()
 
     async def _run_session(self):
+        if self._use_horizon:
+            # Horizon HTTP mode
+            await self._run_horizon_session()
+        else:
+            # Local stdio mode
+            await self._run_stdio_session()
+
+    async def _run_horizon_session(self):
+        """Connect to Horizon MCP server via HTTP."""
+        if not FASTMCP_AVAILABLE:
+            raise RuntimeError("fastmcp is required for Horizon HTTP mode")
+        
+        client = FastMCPClient(
+            self._horizon_url,
+            auth=self._horizon_api_key,  # Bearer token
+        )
+        
+        # Keep client in context until shutdown
+        async with client:
+            self._fastmcp_client = client
+            
+            # List tools (FastMCP returns list directly)
+            tools_list = await client.list_tools()
+            self._tools = [
+                MCPToolInfo(
+                    name=t.name,
+                    description=t.description or "",
+                    input_schema=t.inputSchema or {},
+                )
+                for t in tools_list
+            ]
+
+            # List prompts (FastMCP returns list directly)
+            try:
+                prompts_list = await client.list_prompts()
+                self._prompts = [
+                    MCPPromptInfo(
+                        name=p.name,
+                        description=p.description or "",
+                        arguments=[
+                            {
+                                "name": a.name,
+                                "description": a.description or "",
+                                "required": a.required or False,
+                            }
+                            for a in (p.arguments or [])
+                        ],
+                    )
+                    for p in prompts_list
+                ]
+            except Exception as e:
+                logger.warning(f"Could not list prompts: {e}")
+                self._prompts = []
+
+            self._stop_event = asyncio.Event()
+            self._initialized.set()  # Signal that we're ready
+
+            # Stay alive until shutdown() is called
+            await self._stop_event.wait()
+
+    async def _run_stdio_session(self):
+        """Connect to local MCP server via stdio."""
         merged_env = {**os.environ, **self._env}
 
         params = StdioServerParameters(
@@ -171,16 +270,33 @@ class MCPClient:
 
     def get_prompt(self, name: str, arguments: dict[str, str]) -> str:
         """Synchronously render an MCP prompt and return its text content."""
-        if self._session is None or self._loop is None:
-            raise RuntimeError("MCP client is not initialised.")
+        if self._use_horizon:
+            if self._fastmcp_client is None or self._loop is None:
+                raise RuntimeError("MCP client is not initialised.")
+            
+            async def _get():
+                result = await self._fastmcp_client.get_prompt(name, arguments)
+                parts: list[str] = []
+                for msg in result.messages:
+                    # msg.content can be a string or an object with .text
+                    if isinstance(msg.content, str):
+                        parts.append(msg.content)
+                    elif hasattr(msg.content, "text"):
+                        parts.append(msg.content.text)
+                    else:
+                        parts.append(str(msg.content))
+                return "\n\n".join(parts)
+        else:
+            if self._session is None or self._loop is None:
+                raise RuntimeError("MCP client is not initialised.")
 
-        async def _get():
-            result = await self._session.get_prompt(name, arguments)  # type: ignore[union-attr]
-            parts: list[str] = []
-            for msg in result.messages:
-                if hasattr(msg.content, "text"):
-                    parts.append(msg.content.text)
-            return "\n\n".join(parts)
+            async def _get():
+                result = await self._session.get_prompt(name, arguments)  # type: ignore[union-attr]
+                parts: list[str] = []
+                for msg in result.messages:
+                    if hasattr(msg.content, "text"):
+                        parts.append(msg.content.text)
+                return "\n\n".join(parts)
 
         future = asyncio.run_coroutine_threadsafe(_get(), self._loop)
         try:
@@ -191,16 +307,40 @@ class MCPClient:
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         """Synchronously call an MCP tool and return its text result."""
-        if self._session is None or self._loop is None:
-            raise RuntimeError("MCP client is not initialised.")
+        if self._use_horizon:
+            if self._fastmcp_client is None or self._loop is None:
+                raise RuntimeError("MCP client is not initialised.")
+            
+            async def _call():
+                result = await self._fastmcp_client.call_tool(name, arguments)
+                # FastMCP provides .data (structured) and .content (blocks)
+                # Prefer structured data if available, fallback to content blocks
+                if result.data is not None:
+                    # Structured output - convert to JSON string
+                    return json.dumps(result.data, indent=2, default=str)
+                
+                # Fallback to content blocks
+                parts: list[str] = []
+                for content_item in result.content:
+                    if hasattr(content_item, "text"):
+                        parts.append(content_item.text)
+                    elif hasattr(content_item, "data"):
+                        # Binary data
+                        parts.append(f"[Binary data: {len(content_item.data)} bytes]")
+                    else:
+                        parts.append(str(content_item))
+                return "\n".join(parts) if parts else ""
+        else:
+            if self._session is None or self._loop is None:
+                raise RuntimeError("MCP client is not initialised.")
 
-        async def _call():
-            result = await self._session.call_tool(name, arguments)  # type: ignore[union-attr]
-            parts: list[str] = []
-            for content_item in result.content:
-                if hasattr(content_item, "text"):
-                    parts.append(content_item.text)
-            return "\n".join(parts) if parts else ""
+            async def _call():
+                result = await self._session.call_tool(name, arguments)  # type: ignore[union-attr]
+                parts: list[str] = []
+                for content_item in result.content:
+                    if hasattr(content_item, "text"):
+                        parts.append(content_item.text)
+                return "\n".join(parts) if parts else ""
 
         future = asyncio.run_coroutine_threadsafe(_call(), self._loop)
         try:
